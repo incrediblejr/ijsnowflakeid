@@ -81,7 +81,7 @@ REFERENCES
    extern "C" {
 #endif
 
-#define IJSNOWFLAKEID_MEMORY_SIZE (16)
+#define IJSNOWFLAKEID_MEMORY_SIZE (64+64)
 #define IJSNOWFLAKEID_ALIGNMENT   (8)
 
 typedef struct ijsnowflakeid {
@@ -251,7 +251,10 @@ static IJSF_FORCEINLINE uint64_t ijsnowflakeid__state_timestamp_mask(ijsnowflake
 
 typedef struct ijsnowflakeid_private {
    ijsnowflakeid base;
+   unsigned char cacheline_padding1[64-sizeof(ijsnowflakeid)];
+
    ijsf_atomic64_t state;
+   unsigned char cacheline_padding2[64-sizeof(ijsf_atomic64_t)];
 } ijsnowflakeid_private;
 
 _Static_assert(IJSNOWFLAKEID_MEMORY_SIZE >= sizeof(ijsnowflakeid_private));
@@ -290,9 +293,9 @@ ijsnowflakeid *ijsnowflakeid_init(void *memory, int32_t timestamp_num_bits, int3
    return &res->base;
 }
 
-static IJSF_FORCEINLINE int64_t ijsnowflakeid__from_state(ijsnowflakeid *ctx, uint64_t state, uint64_t state_timestamp_mask, uint32_t machineid) {
-   int32_t num_unused_bits = ctx->unused_num_bits;
-   int32_t num_sequence_bits = ctx->sequence_num_bits;
+static IJSF_FORCEINLINE int64_t ijsnowflakeid__from_state(uint64_t state,
+   uint64_t state_timestamp_mask, int32_t num_unused_bits,
+   int32_t num_sequence_bits, uint32_t machineid) {
 
    /* account for any unused bits and place the timestamp in the most significant bits */
    int64_t snowflakeid = (int64_t)((state&state_timestamp_mask)>>num_unused_bits);
@@ -306,6 +309,8 @@ static IJSF_FORCEINLINE int64_t ijsnowflakeid__from_state(ijsnowflakeid *ctx, ui
 
 int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid) {
    int32_t timeshift = 64-self->timestamp_num_bits;
+   int32_t num_unused_bits = self->unused_num_bits;
+   int32_t num_sequence_bits = self->sequence_num_bits;
 
    uint64_t state_timestamp_mask = ijsnowflakeid__state_timestamp_mask(self);
    uint64_t overflow_mask = ijsnowflakeid__overflow_mask(self);
@@ -351,10 +356,13 @@ int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid) {
          if (ijsf_atomic_cas64_acquire(snowflake_state, timestamp_now_state, current_state)) {
             /* successfully advanced the timestamp. create snowflake from timestamp
                and machineid as this is now the first sequence of this timestamp */
-            snowid = ijsnowflakeid__from_state(self, timestamp_now_state, state_timestamp_mask, machineid);
+            snowid = ijsnowflakeid__from_state(timestamp_now_state, state_timestamp_mask,
+               num_unused_bits, num_sequence_bits, machineid);
+
             IJSF_assert((timestamp_now_state>>timeshift)==(uint64_t)ijsnowflakeid_timestamp(self, snowid));
             IJSF_assert(machineid==ijsnowflakeid_machineid(self, snowid));
             IJSF_assert(0==ijsnowflakeid_sequenceid(self, snowid));
+
             return snowid;
          }
          /* failed to swap, lets continue using that timestamp instead.
@@ -389,7 +397,8 @@ int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid) {
       }
 
       /* did not overflow the sequence ids, make a snowflake from this */
-      snowid = ijsnowflakeid__from_state(self, new_state, state_timestamp_mask, machineid);
+      snowid = ijsnowflakeid__from_state(new_state, state_timestamp_mask,
+         num_unused_bits, num_sequence_bits, machineid);
 
       IJSF_assert((new_state>>timeshift)==(uint64_t)ijsnowflakeid_timestamp(self, snowid));
       IJSF_assert(machineid==ijsnowflakeid_machineid(self, snowid));
