@@ -1,5 +1,7 @@
 /* clang-format off */
 /*
+`ijsnowflakeid` - https://github.com/incrediblejr/ijsnowflakeid
+
 `ijsnowflakeid` is a bit layout configurable, lock-free, and thread-safe implementation of
 Twitter's Snowflake ID [1] or any UUID that adopts a similar approach but varies in
 bit assignments within the UUID. Its configurable bit layout allows users to fully
@@ -10,28 +12,32 @@ A Snowflake ID, henceforth referred to as 'snowflake', is a 64-bit unique identi
 divided into three parts:
 
  * Timestamp
-      The number of milliseconds since a specific epoch
-      (Unix time in the case of `ijsnowflakeid`).
+      The number of milliseconds since a specific epoch.
+      `ijsnowflakeid` uses Unix epoch by default but any start time is configurable.
+      `ijsnowflakeid` also supports custom time unit in ms to facilitate that bits in
+      the snowflake's timestamp can represent a longer lifetime.
 
  * Machine/Instance ID
       A unique identifier for a machine or instance to prevent collisions when
-      snowflakes are generated in the same millisecond in a distributed environment.
+      snowflakes are generated in the same millisecond/time unit in a
+      distributed environment.
 
  * Sequence Number
       A local sequence number assigned to each snowflake generated in the same
-      millisecond. This implies that a machine or instance can generate a
-      maximum of (1 << number of sequence number bits) snowflakes per millisecond.
+      millisecond/time unit. This implies that a machine or instance can generate a
+      maximum of (1 << number of sequence number bits) snowflakes per
+      millisecond/time unit without advancing the time.
 
-One limitation of Snowflake IDs, or similar systems, is the sequence number cap,
-restricting the number of IDs that can be generated per millisecond. A common
-solution is to have the ID generator pause until the next millisecond before
+One limitation of Snowflake IDs, or similar UUIDs, is the sequence number cap,
+restricting the number of IDs that can be generated per millisecond/time unit.
+A common solution is to have the ID generator pause/sleep/spin a time unit before
 generating new IDs, effectively acting as a rate limiter. However, `ijsnowflakeid`
 employs an alternative method by generating IDs set in the future. Instead of
-waiting for a millisecond to elapse, it advances its internal timestamp
-by 1 millisecond and continues ID generation. This approach assumes that such a need,
+waiting for a time unit to elapse, it advances its internal timestamp 1 time unit
+and continues ID generation. This approach assumes that such a need,
 like a sudden spike in requests, is rare and that the real clock will eventually
 synchronize. The duration which it takes to synchronize depends on the average
-load factor (percentage of sequence numbers used during a typical tick) and
+load factor (percentage of sequence numbers used during a typical time unit) and
 the extent of future time borrowed.
 
 Due to its implementation, `ijsnowflakeid` can only guarantee successful artificial
@@ -53,6 +59,38 @@ which means that in *ONE* source file, put:
 
 Other source files should just include ijsnowflakeid.h
 
+EXAMPLE
+   // Twitter Snowflake ID configuration
+   uint32_t timestamp_num_bits = 41;
+   uint32_t machineid_num_bits = 10;
+   uint32_t sequence_num_bits = 12;
+   uint32_t machineid = 3; // optional, will be used with `ijsnowflakeid_generate`
+   uint64_t optional_starttime_in_ms_since_unix_epoch = 1288834974657ull; // (Thu Nov 04 2010 01:42:54 UTC)
+   uint32_t timeunit_in_ms = 1;
+
+   // allocate memory for `ijsnowflakeid` instance
+   void *snowmem = malloc(IJSNOWFLAKEID_MEMORY_SIZE);
+
+   ijsnowflakeid *snow = ijsnowflakeid_init(snowmem,
+      timestamp_num_bits, machineid_num_bits, sequence_num_bits,
+      machineid, optional_starttime_in_ms_since_unix_epoch, timeunit_in_ms);
+
+   int64_t snowflakes[2];
+
+   // generate a unique id, with provided machineid
+   snowflakes[0] = ijsnowflakeid_generate_id(snow, machineid+3);
+   assert(ijsnowflakeid_machineid(snow, snowflakes[0]) == machineid+3);
+
+   // generate a unique id, with machineid of snow
+   snowflakes[1] = ijsnowflakeid_generate(snow);
+   assert(ijsnowflakeid_machineid(snow, snowflakes[1]) == machineid);
+
+   // last snowflake is guaranteed to have same or later timestamp as it happened after
+   assert(ijsnowflakeid_timestamp(snow, snowflakes[1]) >= ijsnowflakeid_timestamp(snow, snowflakes[0]));
+
+   // deallocate memory when done with instance
+   free(snow);
+
 LICENSE
 See end of file for license information
 
@@ -60,7 +98,6 @@ REFERENCES
 
 [1] https://en.wikipedia.org/wiki/Snowflake_ID
 [2] https://github.com/nothings/stb
-
 */
 #ifndef IJSNOWFLAKEID_INCLUDED
 #define IJSNOWFLAKEID_INCLUDED
@@ -85,39 +122,75 @@ REFERENCES
 #define IJSNOWFLAKEID_ALIGNMENT   (8)
 
 typedef struct ijsnowflakeid {
+   uint64_t starttime;
+
    uint8_t timestamp_num_bits;
    uint8_t machineid_num_bits;
    uint8_t sequence_num_bits;
    uint8_t unused_num_bits;
 
    uint32_t machineid;
+   uint32_t timeunit_ms;
+   uint32_t padding32;
 } ijsnowflakeid;
 
 /*
-`memory` have to be at least `IJSNOWFLAKEID_MEMORY_SIZE` bytes with an
-alignment of at least `IJSNOWFLAKEID_ALIGNMENT`
+`memory` must be at least `IJSNOWFLAKEID_MEMORY_SIZE` bytes and aligned to at
+least `IJSNOWFLAKEID_ALIGNMENT`.
 
-`timestamp_num_bits`+`machineid_num_bits`+`sequence_num_bits` defines the
-bit-layout that makes up the 64bit snowflake.
+`timestamp_num_bits`, `machineid_num_bits`, and `sequence_num_bits`
+defines the bit-layout of the 64-bit snowflake. The first `timestamp_num_bits`
+bits are a timestamp, representing time units since the chosen epoch. The next
+`machineid_num_bits` bits represent a machine ID, preventing clashes.
+`sequence_num_bits` more bits represent a per-machine sequence number,
+to allow creation of multiple snowflakes in the same time unit.
 
-`timestamp_num_bits` must be at least 41 bits which guarantees that it can
-generate valid snowflakes until 7 September 2039.
+Example: with 41-bit `timestamp_num_bits`, valid snowflakes can be generated
+until 7 September 2039. To extend the validity period of snowflakes, use a
+combination of `optional_starttime_in_ms_since_unix_epoch`, more
+`timestamp_num_bits`, and/or `optional_timeunit_in_ms` > 1.
 
-NB: iff `ijsnowflakeid` run out of sequence ids for current millisecond it then
-borrows sequences from future ticks. in order for this to work we need bits to
-detect that we ran out of sequence numbers for current millisecond and time for it
-to be able to start borrowing from the future. for this to work we need at least
-fewer than 1<<(64-number of timestamp bits-number of sequence number bits)
-concurrent threads generating ids.
+NB: If `ijsnowflakeid` runs out of sequence IDs for the current millisecond/
+'time unit', it borrows sequences from future ticks. To facilitate this, we
+need bits to detect exhaustion of sequence numbers for the current
+millisecond/'time unit' and time to start borrowing from the future. This
+requires fewer than 1<<(64 - number of timestamp bits - number of sequence
+number bits) concurrent threads generating IDs.
 
-`machineid` is optional but can be used if all snowflakes generated by this
-instance will have the same machineid. this way you don't need to pass machineid to
-`ijsnowflakeid_generate_id` but rather just use `ijsnowflakeid_generate`
+`machineid` is optional but useful if all snowflakes generated by this instance
+will have the same `machineid`. This is the `machineid` that is used in
+`ijsnowflakeid_generate_id`, for using other `machineid` not set during
+initialization `ijsnowflakeid_generate` should be used.
 
-returns a non-null instance on valid input parameters.
+`optional_starttime_in_ms_since_unix_epoch` is an optional custom start time in
+milliseconds since the Unix epoch. This optional start time sets the epoch
+relative to which all snowflakes generated from these settings are measured.
+Setting this to 0 means that all snowflakes' timestamps are relative to the
+Unix epoch.
+
+Examples:
+- Twitter's Snowflake ID uses the custom start time/epoch of 1288834974657
+  (Thu Nov 04 2010 01:42:54 UTC).
+- Discord's IDs use a custom start time/epoch of 1420070400000
+  (Thu Jan 01 2015 00:00:00 UTC).
+- Sonyflakes uses a custom start time/epoch of 1409529600000
+  (Mon Sep 01 2014 00:00:00 UTC). Sonyflakes also uses a 10ms time unit,
+  more details below.
+
+`optional_timeunit_in_ms` defines the time unit (or resolution) of the timestamp,
+with the default being 1 ms. Setting this to 0 or 1 maintains the default time
+unit of 1ms. Increasing this above 1ms extends the lifespan of the snowflakes
+(i.e., the number of years that can be represented by the timestamp), but
+reduces the number of snowflakes that can be generated per millisecond without
+artificially advancing the internal clock, as only (1<<sequence_num_bits)
+can be generated per time unit before the internal clock must be advanced.
+
+Returns a non-null instance on valid input parameters.
 */
-ijsnowflakeid *ijsnowflakeid_init(void *memory, int32_t timestamp_num_bits,
-   int32_t machineid_num_bits, int32_t sequence_num_bits, uint32_t machineid);
+ijsnowflakeid *ijsnowflakeid_init(void *memory, uint32_t timestamp_num_bits,
+   uint32_t machineid_num_bits, uint32_t sequence_num_bits, uint32_t machineid,
+   uint64_t optional_starttime_in_ms_since_unix_epoch,
+   uint32_t optional_timeunit_in_ms);
 
 /* generate a snowflake with machineid */
 int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid);
@@ -131,6 +204,11 @@ static IJSF_FORCEINLINE int64_t ijsnowflakeid_generate(ijsnowflakeid *self) {
 static IJSF_FORCEINLINE int64_t ijsnowflakeid_timestamp(ijsnowflakeid *self, int64_t snowflakeid) {
    int64_t mask = (1ll<<self->timestamp_num_bits)-1;
    return (snowflakeid>>(self->machineid_num_bits+self->sequence_num_bits))&mask;
+}
+
+static IJSF_FORCEINLINE int64_t ijsnowflakeid_timestamp_ms_since_unix_epoch(ijsnowflakeid *self, int64_t snowflakeid) {
+   int64_t timestamp = ijsnowflakeid_timestamp(self, snowflakeid);
+   return (timestamp+self->starttime)*self->timeunit_ms;
 }
 
 static IJSF_FORCEINLINE uint32_t ijsnowflakeid_machineid(ijsnowflakeid *self, int64_t snowflakeid) {
@@ -186,27 +264,33 @@ static IJSF_FORCEINLINE uint32_t ijsnowflakeid_sequenceid(ijsnowflakeid *self, i
 
    #include <Windows.h>
 
-   static IJSF_FORCEINLINE uint64_t ijsnowflakeid__current_time_ms(void) {
+   static IJSF_FORCEINLINE uint64_t ijsnowflakeid__current_time_ms(uint64_t time_interval_ms) {
       FILETIME filetime;
       ULARGE_INTEGER largeint;
 
+      /* filetime represents the number of 100-nanosecond intervals since January 1, 1601 (UTC) */
       #if _WIN32_WINNT >= _WIN32_WINNT_WIN8
          GetSystemTimePreciseAsFileTime(&filetime);
       #else
          GetSystemTimeAsFileTime(&filetime);
       #endif
-      largeint.LowPart  = filetime.dwLowDateTime;
+
+      largeint.LowPart = filetime.dwLowDateTime;
       largeint.HighPart = filetime.dwHighDateTime;
 
-      return ((largeint.QuadPart - 116444736000000000ull) / 10000);
+      /* 116444736000000000 is the number of 100-nanosecond intervals
+         from January 1, 1601 (UTC) until January 1, 1970 (midnight UTC/GMT) (Unix epoch)
+
+         division by 10000 = from 100 nano seconds (10^-7) to millisecond (10^-3) interval */
+      return ((largeint.QuadPart - 116444736000000000ull) / (10000*time_interval_ms));
    }
 #else
    #include <sys/time.h>
-   static IJSF_FORCEINLINE uint64_t ijsnowflakeid__current_time_ms(void) {
+   static IJSF_FORCEINLINE uint64_t ijsnowflakeid__current_time_ms(uint64_t time_interval_ms) {
       struct timeval tv = {0, 0};
       gettimeofday(&tv, NULL);
 
-      return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+      return (((uint64_t)tv.tv_sec * 1000) + ((uint64_t)tv.tv_usec / 1000))/time_interval_ms;
    }
 #endif
 
@@ -215,6 +299,7 @@ static IJSF_FORCEINLINE uint32_t ijsnowflakeid_sequenceid(ijsnowflakeid *self, i
       #define _Static_assert static_assert
    #endif
 
+   #define IJSF_LIKELY(x) (x)
    #define IJSF_UNLIKELY(x) (x)
 
    typedef volatile long long ijsf_atomic64_t;
@@ -224,6 +309,7 @@ static IJSF_FORCEINLINE uint32_t ijsnowflakeid_sequenceid(ijsnowflakeid *self, i
    /* returns non-zero on successful swap */
    static IJSF_FORCEINLINE int32_t ijsf_atomic_cas64_acquire(ijsf_atomic64_t *dst, uint64_t val, uint64_t ref) { return ((uint64_t)InterlockedCompareExchange64(dst, val, ref) == ref) ? 1 : 0; }
 #else
+   #define IJSF_LIKELY(x) __builtin_expect((x), 1)
    #define IJSF_UNLIKELY(x) __builtin_expect((x), 0)
 
    #include <stdatomic.h>
@@ -259,7 +345,11 @@ typedef struct ijsnowflakeid_private {
 
 _Static_assert(IJSNOWFLAKEID_MEMORY_SIZE >= sizeof(ijsnowflakeid_private));
 
-ijsnowflakeid *ijsnowflakeid_init(void *memory, int32_t timestamp_num_bits, int32_t machineid_num_bits, int32_t sequence_num_bits, uint32_t machineid) {
+ijsnowflakeid * ijsnowflakeid_init(void *memory,
+   uint32_t timestamp_num_bits, uint32_t machineid_num_bits, uint32_t sequence_num_bits,
+   uint32_t machineid, uint64_t optional_starttime_in_ms_since_unix_epoch,
+   uint32_t optional_timeunit_in_ms) {
+
    ijsnowflakeid_private *res = (ijsnowflakeid_private*)memory;
 
    uint32_t total_nbits = timestamp_num_bits+machineid_num_bits+sequence_num_bits;
@@ -274,19 +364,27 @@ ijsnowflakeid *ijsnowflakeid_init(void *memory, int32_t timestamp_num_bits, int3
    if (total_nbits > 64)
       return 0;
 
-   if (41 > timestamp_num_bits)
-      return 0;
-
    if (machineid >= (1u<<machineid_num_bits))
       return 0;
+
+   if (!optional_timeunit_in_ms)
+      optional_timeunit_in_ms = 1;
+
+   /* NB: make the starttime in time units */
+   optional_starttime_in_ms_since_unix_epoch /= optional_timeunit_in_ms;
+
+   if (optional_starttime_in_ms_since_unix_epoch >= (1ull<<timestamp_num_bits))
+      return 0;
+
+   res->base.starttime = optional_starttime_in_ms_since_unix_epoch;
 
    res->base.timestamp_num_bits = (uint8_t)timestamp_num_bits;
    res->base.machineid_num_bits = (uint8_t)machineid_num_bits;
    res->base.sequence_num_bits = (uint8_t)sequence_num_bits;
    res->base.unused_num_bits = (uint8_t)unused_num_bits;
 
-   machineid &= (1u<<machineid_num_bits)-1;
    res->base.machineid = machineid;
+   res->base.timeunit_ms = optional_timeunit_in_ms;
 
    res->state = 0;
 
@@ -297,9 +395,9 @@ static IJSF_FORCEINLINE int64_t ijsnowflakeid__from_state(uint64_t state,
    uint64_t state_timestamp_mask, int32_t num_unused_bits,
    int32_t num_sequence_bits, uint32_t machineid) {
 
-   /* account for any unused bits and place the timestamp in the most significant bits */
+   /* Account for any unused bits and place the timestamp in the most significant bits. */
    int64_t snowflakeid = (int64_t)((state&state_timestamp_mask)>>num_unused_bits);
-   /* we only create snowflakes from a state where overflow buffer is empty,
+   /* We only create snowflakes from a state where overflow buffer is empty,
       therefor the below mask is valid  */
    snowflakeid |= (int64_t)(state&~state_timestamp_mask);
    snowflakeid |= (int64_t)machineid<<num_sequence_bits;
@@ -312,6 +410,9 @@ int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid) {
    int32_t num_unused_bits = self->unused_num_bits;
    int32_t num_sequence_bits = self->sequence_num_bits;
 
+   uint64_t timeunit_ms = self->timeunit_ms;
+
+   uint64_t snowflake_starttime = self->starttime;
    uint64_t state_timestamp_mask = ijsnowflakeid__state_timestamp_mask(self);
    uint64_t overflow_mask = ijsnowflakeid__overflow_mask(self);
 
@@ -320,9 +421,10 @@ int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid) {
    ijsf_atomic64_t *snowflake_state = &((ijsnowflakeid_private*)self)->state;
    int64_t snowid;
 
-   /* snowflake state is used for bookkeeping and lock-free concurrent snowflake generation
+   /* Snowflake state is used for bookkeeping and lock-free concurrent snowflake
+      generation
 
-      timestamp (T) is stored in the MSB and LSB stores the current sequence id(I),
+      Timestamp(T) is stored in the MSB and LSB stores the current sequence id(I),
       the in between bits is used as a overflow buffer to detect that current
       timestamp ran out of sequences.
 
@@ -331,31 +433,42 @@ int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid) {
          - 10-bit machineid
          - 12-bit sequence id
 
-      for a total of 63-bits. all unused bits (from the full 64-bits) becomes overflow
-      bits as we do not store machineid in the state. this means that we can generate
-      (1<<num sequence bit) snowflakes per millisecond before we overflow.
+      for a total of 63-bits. All unused bits (from the full 64-bits) becomes
+      overflow bits as we do not store machineid in the state. This means that we
+      can generate (1<<num sequence bit) snowflakes per `timeunit_ms` before we
+      overflow.
 
       MSB                                                           LSB
       [TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTOOOOOOOOOOOIIIIIIIIIIII]
 
       once all sequence ids for current timestamp is used up we overflow into the
-      bits assigned for the overflow buffer and will try to manually advance the timestamp
-      to recover from the overflow. this means that we can have at most (1<<num bits for overflow buffer)
-      concurrent writers, which is not a issue in reality (:tm:)
+      bits assigned for the overflow buffer and will try to manually advance the
+      timestamp to recover from the overflow. This means that we can have at most
+      (1<<num bits for overflow buffer) concurrent writers, which is not a issue
+      in reality (:tm:)
     */
-   timestamp_now = ijsnowflakeid__current_time_ms();
-   timestamp_now_state = timestamp_now << timeshift;
-   IJSF_assert((timestamp_now>>self->timestamp_num_bits)==0);
+   timestamp_now = ijsnowflakeid__current_time_ms(timeunit_ms);
+
+   if (IJSF_LIKELY(timestamp_now > snowflake_starttime)) {
+      timestamp_now -= snowflake_starttime;
+      timestamp_now_state = timestamp_now << timeshift;
+      IJSF_assert((timestamp_now>>self->timestamp_num_bits)==0);
+   } else {
+      /* Either clock have gone backwards or a badly configured starttime, do best
+         we can by setting the timestamp to zero and use the one stored in state */
+      timestamp_now_state = timestamp_now = 0;
+   }
+
    IJSF_assert((machineid>>self->machineid_num_bits)==0);
 
    for (;;) {
       uint64_t current_state = ijsf_atomic_load64(snowflake_state);
       uint64_t timestamp_state = (current_state&state_timestamp_mask);
       if (timestamp_now_state > timestamp_state) {
-         /* current time is newer than stored state, try to advance time */
+         /* Current time is newer than stored state, try to advance time. */
          if (ijsf_atomic_cas64_acquire(snowflake_state, timestamp_now_state, current_state)) {
-            /* successfully advanced the timestamp. create snowflake from timestamp
-               and machineid as this is now the first sequence of this timestamp */
+            /* Successfully advanced the timestamp. create snowflake from timestamp
+               and machineid as this is now the first sequence of this timestamp. */
             snowid = ijsnowflakeid__from_state(timestamp_now_state, state_timestamp_mask,
                num_unused_bits, num_sequence_bits, machineid);
 
@@ -365,38 +478,38 @@ int64_t ijsnowflakeid_generate_id(ijsnowflakeid *self, uint32_t machineid) {
 
             return snowid;
          }
-         /* failed to swap, lets continue using that timestamp instead.
-            NB: it is possible that the one that successfully completed the swap did so with
+         /* Failed to swap, lets continue using that timestamp instead.
+            NB: It is possible that the one that successfully completed the swap did so with
             an older timestamp, but the most important feature of (this) snowflake is the
-            increasing timestamp and unique ids, not the _absolute_ order. */
+            increasing timestamp and unique ids, not the absolute order. */
       }
 
       /* add one to the sequence id and check if it overflowed */
       new_state = ijsf_atomic_add64(snowflake_state, 1);
       if (IJSF_UNLIKELY(new_state&overflow_mask)) {
-         /*
-         All sequences of the current timestamp have been used up.
+         /* All sequences of the current timestamp have been used up.
 
-         We can now either wait for `ijsnowflakeid__current_time_ms` to advance so we can
-         try to swap the current timestamp, or we can bypass the wait by advancing time
-         ourselves.
+         We can now either wait for `ijsnowflakeid__current_time_ms` to advance
+         `timeunit_ms` so we can try to swap the current timestamp, or we can
+         bypass the wait by advancing time ourselves.
 
-         Knowing that we are working with millisecond granularity, we simply advance by
-         1 millisecond and swap in the next loop. This approach ensures that the snowflake
-         generation does not act as a rate limiter and should be a very unusual case.
+         We simply advance time by `timeunit_ms` and try to swap in the next loop.
+         This approach ensures that the snowflake generation does not act as a
+         rate limiter and should be a very unusual case.
 
-         NB: This means that if we encounter many "overflow -> cheat timestamp -> overflow -> cheat timestamp" loops,
-         we will move forward "into the future". However, since we never allow going back in time,
-         we still guarantee unique snowflakes. The system will correct itself once
-         the current surge in snowflake generation slows down, and real time catches
-         up with the artificially advanced time.
+         NB: This means that if we encounter many
+         'overflow->"cheat timestamp"->overflow->"cheat timestamp"' loops,
+         we will move forward "into the future". However, since we never allow going
+         back in time, we still guarantee unique snowflakes. The system will correct
+         itself once the current surge in snowflake generation slows down, and real
+         time catches up with the artificially advanced time.
 
-         Now artificially advance time by 1 millisecond and try to swap in the next iteration... */
+         Now artificially advance time by 1 `timeunit_ms` and try to swap in the next iteration... */
          timestamp_now_state = (new_state&state_timestamp_mask)+(1ull<<timeshift);
          continue;
       }
 
-      /* did not overflow the sequence ids, make a snowflake from this */
+      /* Did not overflow the sequence ids, make a snowflake from this. */
       snowid = ijsnowflakeid__from_state(new_state, state_timestamp_mask,
          num_unused_bits, num_sequence_bits, machineid);
 
